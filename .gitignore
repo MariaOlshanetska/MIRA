@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Logs
+*.log
+data/logs/*
+
+# Local data
+data/audio_samples/*
+!data/audio_samples/.gitkeep
+
+# Models
+models/whisper/*
+!models/whisper/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test/cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environment / secrets
+.env
+*.env
+secrets.*
+*.key
+
+# ROS / colcon
+build/
+install/
+log/

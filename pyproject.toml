@@ -1,0 +1,30 @@
+[project]
+name = "dialogue-manager"
+version = "0.1.0"
+description = "Dialogue manager for LLM-driven embodied agent interaction."
+requires-python = ">=3.10"
+dependencies = [
+    "faster-whisper>=1.0",
+    "numpy>=1.26",
+    "sounddevice>=0.4",
+    "soundfile>=0.12",
+    "pydantic>=2.0",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+    "requests>=2.31",
+    "opencv-python>=4.9",
+    "praat-parselmouth>=0.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+    "mypy>=1.8",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
