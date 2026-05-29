@@ -383,6 +383,8 @@ class EngagementAccumulator:
         self,
         rho: float = 0.955,
         eta: float = 0.75,
+        eta_up: float = 0.18,
+        eta_down: float = 0.65,
         w_prosody: float = 0.55,
         w_visual: float = 0.45,
         a0: float = 1.2,
@@ -411,6 +413,8 @@ class EngagementAccumulator:
     ):
         self.rho = float(rho)
         self.eta = float(eta)
+        self.eta_up = float(eta_up)
+        self.eta_down = float(eta_down)
         self.w_prosody = float(w_prosody)
         self.w_visual = float(w_visual)
         self.a0 = float(a0)
@@ -507,22 +511,17 @@ class EngagementAccumulator:
             pairs.append((effective_weight, score))
 
         if use_gaze_override:
-            # Replace instantaneous gaze with role-window gaze score, BUT keep
-            # the other visual channels. The previous version returned here in
-            # practice, so crossed_arms / sleepy_eyes / torso did not affect
-            # fusion whenever role-gaze override was enabled.
             consider("role_gaze", self.w_gaze, "role_gaze", gaze_score_override)
         else:
-            # Always fuse the rest of the visual evidence. This is essential for
-            # demo behaviour: crossed arms and sleepy eyes should push engagement
-            # down even when gaze is being smoothed by the role-window tracker.
             consider("gaze", self.w_gaze, vis.gaze, score_gaze(vis.gaze))
-            consider("torso_position", self.w_torso, vis.torso_position, score_torso_position(vis.torso_position))
-            consider("feet_pointing", self.w_feet, vis.feet_pointing, score_towards_away(vis.feet_pointing), hidden_labels=("not_visible",))
-            consider("crossed_arms", self.w_crossed_arms, vis.crossed_arms, score_crossed_arms(vis.crossed_arms))
-            consider("sleepy_eyes", self.w_sleepy_eyes, vis.sleepy_eyes, score_sleepy_eyes(vis.sleepy_eyes))
-            consider("smile", self.w_smile, vis.smile, score_smile(vis.smile))
-            consider("eyebrow_raise", self.w_eyebrow_raise, vis.eyebrow_raise, score_eyebrow_raise(vis.eyebrow_raise))
+
+        # Always include the rest of the visual channels.
+        consider("torso_position", self.w_torso, vis.torso_position, score_torso_position(vis.torso_position))
+        consider("feet_pointing", self.w_feet, vis.feet_pointing, score_towards_away(vis.feet_pointing), hidden_labels=("not_visible",))
+        consider("crossed_arms", self.w_crossed_arms, vis.crossed_arms, score_crossed_arms(vis.crossed_arms))
+        consider("sleepy_eyes", self.w_sleepy_eyes, vis.sleepy_eyes, score_sleepy_eyes(vis.sleepy_eyes))
+        consider("smile", self.w_smile, vis.smile, score_smile(vis.smile))
+        consider("eyebrow_raise", self.w_eyebrow_raise, vis.eyebrow_raise, score_eyebrow_raise(vis.eyebrow_raise))
 
         if not pairs:
             return 0.0, 0.0
@@ -580,10 +579,18 @@ class EngagementAccumulator:
 
     def update(self, state: EngagementState, r_t: float, s_t: float) -> EngagementState:
         pull_to_center = self.center_pull * np.tanh(state.z)
+
         if self.hold_on_no_evidence and (r_t <= 0.0 or abs(s_t) <= EPS):
             z_new = state.z - pull_to_center
             return EngagementState(z=float(z_new), e=sigmoid(z_new))
-        z_new = self.rho * state.z + self.eta * r_t * s_t - pull_to_center
+
+        # Negative evidence should move faster than positive evidence.
+        if s_t < 0.0:
+            eta = self.eta_down
+        else:
+            eta = self.eta_up
+
+        z_new = self.rho * state.z + eta * r_t * s_t - pull_to_center
         return EngagementState(z=float(z_new), e=sigmoid(z_new))
 
 
@@ -1119,10 +1126,12 @@ def parse_args():
     parser.add_argument("--print-format", choices=["text", "json", "none"], default="text")
     parser.add_argument("--no-window", action="store_true", help="Do not open OpenCV window")
 
-    parser.add_argument("--rho", type=float, default=0.86)
+    parser.add_argument("--rho", type=float, default=0.96)
     parser.add_argument("--eta", type=float, default=0.35)
-    parser.add_argument("--w-prosody", type=float, default=0.25)
-    parser.add_argument("--w-visual", type=float, default=0.75)
+    parser.add_argument("--eta-up", type=float, default=0.18)
+    parser.add_argument("--eta-down", type=float, default=0.65)
+    parser.add_argument("--w-prosody", type=float, default=0.45)
+    parser.add_argument("--w-visual", type=float, default=0.55)
     parser.add_argument("--hold-on-no-evidence", type=int, default=1)
     parser.add_argument("--w-intensity", type=float, default=1.2)
     parser.add_argument("--w-rhythm", type=float, default=0.8)
@@ -1134,7 +1143,7 @@ def parse_args():
     parser.add_argument("--w-sleepy-eyes", type=float, default=0.55)
     parser.add_argument("--w-smile", type=float, default=1.1)
     parser.add_argument("--w-eyebrow-raise", type=float, default=0.8)
-    parser.add_argument("--center-pull", type=float, default=0.04)
+    parser.add_argument("--center-pull", type=float, default=0.012)
     parser.add_argument("--habituation-grace-sec", type=float, default=4.0)
     parser.add_argument("--habituation-floor", type=float, default=0.65)
     parser.add_argument("--role-voiced-thresh", type=float, default=0.20,
@@ -1187,6 +1196,8 @@ def main() -> int:
     model = EngagementAccumulator(
         rho=args.rho,
         eta=args.eta,
+        eta_up=args.eta_up,
+        eta_down=args.eta_down,
         w_prosody=args.w_prosody,
         w_visual=args.w_visual,
         a0=args.w_intensity,
