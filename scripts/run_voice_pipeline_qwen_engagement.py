@@ -19,12 +19,14 @@ from dialogue_manager.tts.expressive_client import ExpressiveTTSClient
 
 DEFAULT_ENGAGEMENT_URL = "http://10.10.200.182/engagement_maria/engagement_maria"
 
-OPENING_ANNOTATED_RESPONSE = (
-    "[emotion: neutral] *face: FACE_SMILE_01* Welcome. "
-    "Thank you for joining. My name is Aera. "
-    "Today's goal is to get a first impression of each other. "
-    "[silence: 0.5] *gesture: deictic_you* Could you please start by introducing yourself?"
-)
+def build_opening_annotated_response(candidate_profession: str) -> str:
+    return (
+        "[emotion: happiness] *face: FACE_SMILE_LOW* Hi, welcome. "
+        "It is really nice to finally meet you. "
+        "[silence: 0.3] *gesture: DEICTIC_ME_1* My name is Aera, and I will be guiding this first conversation today. "
+        f"[silence: 0.3] *gesture: EXPLAIN_BEAT_1* This interview will be focused on your career as {candidate_profession}. "
+        "[silence: 0.4] *gesture: DEICTIC_YOU_1* How are you doing today?"
+    )
 
 def print_dialogue_output(output) -> None:
     print("\n" + "=" * 60)
@@ -139,6 +141,15 @@ def main() -> None:
         print("WARNING: engagement recognizer is not ready yet.")
         print("The dialogue manager will use neutral engagement until values arrive.")
 
+    print("\nBefore Aera starts, enter the candidate's profession or field.")
+    print("Example: nurse, architect, primary school teacher, software developer, firefighter...")
+    candidate_profession = input("Candidate profession / field: ").strip()
+
+    if not candidate_profession:
+        candidate_profession = "a general professional field"
+
+    print(f"\nCandidate profession set to: {candidate_profession}")
+
     print("\nLoading Whisper...")
     stt = WhisperLocalSTT(
         model_name=args.whisper_model,
@@ -167,7 +178,8 @@ def main() -> None:
     print("Type q + ENTER to quit.")
     print("Speak in English after Aera's first question.\n")
 
-    opening_output = parse_annotated_response(OPENING_ANNOTATED_RESPONSE)
+    opening_annotated_response = build_opening_annotated_response(candidate_profession)
+    opening_output = parse_annotated_response(opening_annotated_response)
 
     print_dialogue_output(opening_output)
 
@@ -201,11 +213,21 @@ def main() -> None:
 
     # Store the opening in dialogue history so Qwen knows the interview has already started.
     opening_turn = DialogueTurn(
-        user_input=UserTurnInput(user_text="[session_start]"),
+        user_input=UserTurnInput(
+            user_text=(
+                "[session_start]\n"
+                f"Candidate profession / field: {candidate_profession}\n"
+                "Aera must adapt the interview to this professional field. "
+                "Do not assume the candidate is a computational linguist unless this profession was explicitly provided."
+            )
+        ),
         engagement=engagement.snapshot(),
         output=opening_output,
-        raw_llm_output=OPENING_ANNOTATED_RESPONSE,
-        metadata={"type": "agent_opening"},
+        raw_llm_output=opening_annotated_response,
+        metadata={
+            "type": "agent_opening",
+            "candidate_profession": candidate_profession,
+        },
     )
 
     pipeline.state.add_turn(opening_turn)
