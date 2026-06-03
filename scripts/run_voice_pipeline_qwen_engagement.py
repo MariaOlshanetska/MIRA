@@ -8,7 +8,7 @@ from dialogue_manager.core.pipeline import DialoguePipeline
 from dialogue_manager.engagement.realtime_subprocess import RealtimeEngagementSubprocessAnalyzer
 from dialogue_manager.engagement.types import EngagementState
 from dialogue_manager.llm.qwen_client import QwenLLMClient
-from dialogue_manager.stt.audio_io import list_input_devices, record_microphone_until_silence
+from dialogue_manager.stt.audio_io import list_input_devices, wait_for_speech_then_record_until_silence
 from dialogue_manager.stt.whisper_local import WhisperLocalSTT
 from dialogue_manager.tts.formatter import build_tts_api_text
 from dialogue_manager.core.turn import DialogueTurn, UserTurnInput
@@ -73,6 +73,10 @@ def main() -> None:
     parser.add_argument("--silence-seconds", type=float, default=1.2)
     parser.add_argument("--silence-threshold", type=float, default=0.015)
     parser.add_argument("--min-record-seconds", type=float, default=1.0)
+    parser.add_argument("--speech-start-threshold", type=float, default=None)
+    parser.add_argument("--speech-start-seconds", type=float, default=0.2)
+    parser.add_argument("--pre-roll-seconds", type=float, default=0.3)
+    parser.add_argument("--max-wait-seconds", type=float, default=None)
 
     # Whisper
     parser.add_argument("--whisper-model", type=str, default="medium.en")
@@ -132,7 +136,7 @@ def main() -> None:
     if ready:
         print("\nEngagement calibration finished.")
         print("Engagement recognizer is now running continuously.")
-        print("You can now press ENTER to speak to the dialogue manager.")
+        print("Aera will start after setup. After Aera speaks, the microphone will listen automatically.")
 
         latest_score = engagement.get_latest_score()
         if latest_score is not None:
@@ -174,9 +178,28 @@ def main() -> None:
         llm_client=llm_client,
     )
 
+    agent_speaking = False
+
+    def play_agent_wav(wav_path: Path) -> None:
+        """
+        Blocking local playback wrapper.
+
+        For Unreal integration, replace these assignments with the event/callback
+        Jordi exposes, for example: on_agent_speech_start / on_agent_speech_end.
+        """
+        nonlocal agent_speaking
+        agent_speaking = True
+        print("agent_speaking=True")
+        try:
+            play_wav_file(wav_path)
+        finally:
+            agent_speaking = False
+            print("agent_speaking=False")
+
     print("\nVoice dialogue pipeline ready.")
     print("Aera will start the interview.")
-    print("Type q + ENTER to quit.")
+    print("After Aera speaks, the microphone will listen automatically.")
+    print("Press Ctrl+C to quit.")
     print("Speak in English after Aera's first question.\n")
 
     opening_annotated_response = build_opening_annotated_response(candidate_profession)
@@ -206,9 +229,10 @@ def main() -> None:
         print(f"TTS WAV saved to: {wav_path}")
         print("Playing Aera's opening message...")
 
-        play_wav_file(wav_path)
+        play_agent_wav(wav_path)
 
     except Exception as exc:
+        agent_speaking = False
         print("\nERROR while generating or playing opening TTS audio:")
         print(exc)
 
@@ -240,7 +264,7 @@ def main() -> None:
 
     pipeline.state.add_turn(opening_turn)
 
-    print("\nNow press ENTER to answer Aera.")
+    print("\nAera finished speaking. Listening...")
 
     engagement_warning_printed = False
 
@@ -254,31 +278,38 @@ def main() -> None:
                 engagement_warning_printed = True
 
             current_score = engagement.get_latest_score()
-            if current_score is None:
-                score_text = "unknown"
-            else:
-                score_text = f"{current_score:.3f}"
+            score_text = "unknown" if current_score is None else f"{current_score:.3f}"
+            print(f"\nCurrent engagement={score_text}. Waiting for candidate speech...")
 
-            command = input(
-                f"Current engagement={score_text}. Press ENTER to answer Aera, or q to quit: "
-            ).strip().lower()
-
-            if command == "q":
-                print("Exiting.")
-                break
+            if agent_speaking:
+                # In this local TTS version, play_agent_wav is blocking, so this should
+                # normally never happen. The guard is useful for future Unreal integration.
+                print("Agent is still speaking; microphone is not armed yet.")
+                continue
 
             with tempfile.TemporaryDirectory() as temp_dir:
                 audio_path = Path(temp_dir) / "user_turn.wav"
 
-                record_microphone_until_silence(
+                speech_detected = wait_for_speech_then_record_until_silence(
                     output_path=audio_path,
                     sample_rate=args.sample_rate,
                     device_index=args.device_index,
+                    speech_start_threshold=(
+                        args.speech_start_threshold
+                        if args.speech_start_threshold is not None
+                        else args.silence_threshold
+                    ),
+                    speech_start_seconds=args.speech_start_seconds,
                     silence_seconds=args.silence_seconds,
                     silence_threshold=args.silence_threshold,
                     min_record_seconds=args.min_record_seconds,
                     max_record_seconds=args.duration,
+                    max_wait_seconds=args.max_wait_seconds,
+                    pre_roll_seconds=args.pre_roll_seconds,
                 )
+
+                if not speech_detected:
+                    continue
 
                 print("\nTranscribing with Whisper...")
                 transcription = stt.transcribe_file(audio_path)
@@ -290,7 +321,7 @@ def main() -> None:
             print("-" * 60)
 
             if not transcription.text:
-                print("No speech detected. Skipping this turn.\n")
+                print("No speech detected by Whisper. Listening again.\n")
                 continue
 
             engagement_score = engagement.get_latest_score()
@@ -306,11 +337,6 @@ def main() -> None:
                     transcription.text,
                     engagement_score=engagement_score,
                 )
-
-            print("\nSending turn to dialogue pipeline / Qwen...")
-
-            try:
-                output = pipeline.process_text_turn(transcription.text)
             except Exception as exc:
                 print("\nERROR while processing dialogue turn:")
                 print(exc)
@@ -340,9 +366,10 @@ def main() -> None:
                 print(f"TTS WAV saved to: {wav_path}")
                 print("Playing TTS audio...")
 
-                play_wav_file(wav_path)
+                play_agent_wav(wav_path)
 
             except Exception as exc:
+                agent_speaking = False
                 print("\nERROR while generating or playing TTS audio:")
                 print(exc)
 
