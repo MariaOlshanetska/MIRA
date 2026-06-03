@@ -52,7 +52,11 @@ def build_user_prompt(request: LLMRequest) -> str:
     if not recent_history:
         recent_history = "[No previous dialogue history.]"
 
-    engagement_summary = request.engagement.summary or "[No engagement summary available.]"
+    engagement_score = request.engagement.score
+    if engagement_score is None:
+        engagement_score_text = "0.500"
+    else:
+        engagement_score_text = f"{engagement_score:.3f}"
 
     return f"""
 You are generating the next response in an ongoing live interview.
@@ -60,10 +64,11 @@ You are generating the next response in an ongoing live interview.
 Recent dialogue history, for context only:
 {recent_history}
 
-Current engagement:
-- level: {request.engagement.level}
-- score: {request.engagement.score}
-- summary: {engagement_summary}
+Current realtime engagement score:
+{engagement_score_text}
+
+Use the Engagement Adaptation Policy from the system prompt to interpret this score.
+Do not mention the numeric engagement score to the candidate.
 
 MOST RECENT USER INPUT:
 {request.user_input.user_text}
@@ -79,8 +84,6 @@ Dialogue rules:
 - Do not keep asking the same question if the candidate already answered it.
 - If the candidate asks a question, answer it briefly first.
 - If the candidate gives an answer, acknowledge it briefly before moving on.
-- If engagement is low, do not just repeat the interview question. Make an interaction-repair move.
-- If engagement is very low, you may ask whether the candidate wants to continue or finish the interview.
 - Ask only one question at a time.
 - Keep the response concise and natural.
 
