@@ -9,10 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from dialogue_manager.core.state import DialogueState
-from dialogue_manager.core.turn import UserTurnInput
 from dialogue_manager.engagement.base import EngagementAnalyzer
-from dialogue_manager.engagement.types import EngagementSignal, EngagementState
 
 
 class RealtimeEngagementSubprocessAnalyzer(EngagementAnalyzer):
@@ -22,6 +19,8 @@ class RealtimeEngagementSubprocessAnalyzer(EngagementAnalyzer):
 
     The external script must print one JSON row per update when called with:
         --print-format json
+    This class deliberately exposes only the latest numeric score to the
+    dialogue manager. Dialogue policy belongs in the prompt.
     """
 
     def __init__(
@@ -130,11 +129,6 @@ class RealtimeEngagementSubprocessAnalyzer(EngagementAnalyzer):
     def is_running(self) -> bool:
         return self.process is not None and self.process.poll() is None
 
-    def snapshot(self) -> EngagementState:
-        dummy_input = UserTurnInput(user_text="[snapshot]")
-        dummy_state = DialogueState()
-        return self.analyze(dummy_input, dummy_state)
-
     def get_process_status(self) -> str:
         if self.process is None:
             return "not_started"
@@ -197,6 +191,9 @@ class RealtimeEngagementSubprocessAnalyzer(EngagementAnalyzer):
         return False
 
     def get_latest_score(self) -> float | None:
+        """
+        Return only the latest engagement score produced by the realtime script.
+        """
         with self.lock:
             if not self.latest_row:
                 return None
@@ -204,132 +201,7 @@ class RealtimeEngagementSubprocessAnalyzer(EngagementAnalyzer):
             value = self.latest_row.get("engagement")
 
         try:
-            return float(value)
+            score = float(value)
         except (TypeError, ValueError):
             return None
-
-    def analyze(
-        self,
-        user_input: UserTurnInput,
-        state: DialogueState,
-    ) -> EngagementState:
-        with self.lock:
-            row = dict(self.latest_row) if self.latest_row is not None else None
-            latest_update_time = self.latest_update_time
-
-        if row is None:
-            return EngagementState(
-                level="medium",
-                score=0.5,
-                signals=[
-                    EngagementSignal(
-                        name="engagement_available",
-                        value=False,
-                        confidence=1.0,
-                    )
-                ],
-                summary=(
-                    "No realtime engagement value is available yet. "
-                    "Use a neutral interviewing strategy."
-                ),
-                metadata={
-                    "source": "realtime_subprocess",
-                    "ready": False,
-                    "log_path": str(self.log_path),
-                },
-            )
-
-        score = float(row.get("engagement", 0.5))
-
-        if score < 0.30:
-            level = "very_low"
-            instruction = (
-                "The user's engagement is critically low. "
-                "Do not continue the normal interview agenda. "
-                "The interviewer should make a firm interaction-repair move. "
-                "The interviewer may sound mildly annoyed, surprised, or disappointed, "
-                "while remaining professional. "
-                "Ask whether the candidate wants to continue the interview or stop here. "
-                "Do not repeat the previous interview question."
-            )
-        elif score < 0.45:
-            level = "low"
-            instruction = (
-                "The user's engagement is low. "
-                "Do not simply repeat the previous question. "
-                "Acknowledge that the interaction is not flowing naturally. "
-                "Ask a shorter, more direct question, or ask whether the candidate "
-                "wants to continue the interview. "
-                "The interviewer may be firm but must remain professional."
-            )
-        elif score < 0.60:
-            level = "medium"
-            instruction = (
-                "The user's engagement is moderate. "
-                "Continue the interview, but keep the response concise and clear. "
-                "Respond to the candidate's most recent utterance first. "
-                "Ask only one question."
-            )
-        elif score < 0.80:
-            level = "high"
-            instruction = (
-                "The user's engagement is good. "
-                "Respond naturally to the candidate's most recent utterance, "
-                "then continue the interview with a relevant follow-up."
-            )
-        else:
-            level = "very_high"
-            instruction = (
-                "The user's engagement is very high. "
-                "Respond to the candidate's most recent utterance and continue naturally. "
-                "You may ask a more open follow-up or ask about availability to start."
-            )
-
-        age_seconds = None
-        if latest_update_time is not None:
-            age_seconds = time.time() - latest_update_time
-
-        signals = [
-            EngagementSignal(
-                name="engagement_score",
-                value=score,
-                confidence=1.0,
-            ),
-            EngagementSignal(
-                name="role",
-                value=str(row.get("role")),
-                confidence=None,
-            ),
-            EngagementSignal(
-                name="gaze",
-                value=str(row.get("gaze")),
-                confidence=None,
-            ),
-            EngagementSignal(
-                name="torso_position",
-                value=str(row.get("torso_position")),
-                confidence=None,
-            ),
-            EngagementSignal(
-                name="smile",
-                value=str(row.get("smile")),
-                confidence=None,
-            ),
-        ]
-
-        return EngagementState(
-            level=level,
-            score=score,
-            signals=signals,
-            summary=(
-                f"Realtime engagement score is {score:.3f}. "
-                f"{instruction}"
-            ),
-            metadata={
-                "source": "realtime_subprocess",
-                "ready": True,
-                "latest_update_age_seconds": age_seconds,
-                "log_path": str(self.log_path),
-                "raw_row": row,
-            },
-        )
+        return max(0.0, min(1.0, score))

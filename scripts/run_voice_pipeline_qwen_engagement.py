@@ -6,6 +6,7 @@ from pathlib import Path
 
 from dialogue_manager.core.pipeline import DialoguePipeline
 from dialogue_manager.engagement.realtime_subprocess import RealtimeEngagementSubprocessAnalyzer
+from dialogue_manager.engagement.types import EngagementState
 from dialogue_manager.llm.qwen_client import QwenLLMClient
 from dialogue_manager.stt.audio_io import list_input_devices, record_microphone_until_silence
 from dialogue_manager.stt.whisper_local import WhisperLocalSTT
@@ -221,7 +222,14 @@ def main() -> None:
                 "Do not assume the candidate is a computational linguist unless this profession was explicitly provided."
             )
         ),
-        engagement=engagement.snapshot(),
+        engagement=EngagementState(
+            score=0.5,
+            summary="Opening turn before candidate response; neutral engagement.",
+            metadata={
+                "source": "agent_opening",
+                "ready": False,
+            },
+        ),
         output=opening_output,
         raw_llm_output=opening_annotated_response,
         metadata={
@@ -285,15 +293,19 @@ def main() -> None:
                 print("No speech detected. Skipping this turn.\n")
                 continue
 
-            engagement_snapshot = engagement.snapshot()
+            engagement_score = engagement.get_latest_score()
+            if engagement_score is None:
+                print("Engagement score sent to prompt: unavailable -> using neutral 0.500")
+            else:
+                print(f"Engagement score sent to prompt: {engagement_score:.3f}")
 
-            print("\n" + "-" * 60)
-            print("ENGAGEMENT SNAPSHOT SENT TO PROMPT")
-            print("-" * 60)
-            print(f"level: {engagement_snapshot.level}")
-            print(f"score: {engagement_snapshot.score}")
-            print(f"summary: {engagement_snapshot.summary}")
-            print("-" * 60)
+            print("\nSending turn to dialogue pipeline / Qwen...")
+
+            try:
+                output = pipeline.process_text_turn(
+                    transcription.text,
+                    engagement_score=engagement_score,
+                )
 
             print("\nSending turn to dialogue pipeline / Qwen...")
 
