@@ -5,7 +5,7 @@ from pathlib import Path
 from dialogue_manager.llm.base import LLMRequest
 
 
-PROJECT_ROOT = Path.cwd()
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
 def load_prompt_file(relative_path: str) -> str:

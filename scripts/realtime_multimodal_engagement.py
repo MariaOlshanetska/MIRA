@@ -228,15 +228,24 @@ class EngagementState:
 
 
 def load_config_url() -> Optional[str]:
+    if not os.path.exists(CONFIG_PATH):
+        return None
+
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
+
         params = cfg["/llm_bridge"]["ros__parameters"]
         base_url = params["server_workstation_url"].rstrip("/")
         endpoint = params["vlm_engagement_endpoint"]
+
         return base_url + endpoint
+
     except Exception as e:
-        print(f"WARNING: Could not read config ({e}), using --url or fallback only", flush=True)
+        print(
+            f"WARNING: Could not read config ({e}), using --url or fallback only",
+            flush=True,
+        )
         return None
 
 
