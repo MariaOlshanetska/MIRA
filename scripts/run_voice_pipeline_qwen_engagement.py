@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import random
 import tempfile
+import threading
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from dialogue_manager.core.pipeline import DialoguePipeline
@@ -20,7 +24,44 @@ from dialogue_manager.tts.expressive_client import ExpressiveTTSClient
 
 DEFAULT_ENGAGEMENT_URL = "http://10.10.200.182/engagement_maria/engagement_maria"
 
-def build_opening_annotated_response(candidate_profession: str) -> str:
+DEFAULT_REPAIR_ANNOTATED_RESPONSES = [
+    (
+        "[emotion: neutral] *face: FACE_SOFT_SMILE* Let me pause there for a second. "
+        "[silence: 0.3] *gesture: PALMS_UP_1* Is everything okay, or would you like me to rephrase?"
+    ),
+    (
+        "[emotion: neutral] *face: FACE_CONFUSED_LOW* I might be going a bit too fast. "
+        "[silence: 0.3] *gesture: PALMS_UP_1* Would you like me to slow down or ask that differently?"
+    ),
+    (
+        "[emotion: neutral] *gesture: EMBLEM_WAIT_HOLDON_2* Let me stop there for a moment. "
+        "[silence: 0.3] *face: FACE_SOFT_SMILE* Are you still with me?"
+    ),
+    (
+        "[emotion: neutral] *face: FACE_CONFUSED_LOW* I feel like I am loosing you. "
+        "[silence: 0.3] *gesture: PALMS_UP_1* Should I rephrase the question?"
+    ),
+    (
+        "[emotion: neutral] *gesture: EMBLEM_WAIT_HOLDON_2* Let me pause the interview for a second. "
+        "[silence: 0.3] *gesture: DEICTIC_YOU_1* Are you okay to continue?"
+    ),
+    (
+        "[emotion: neutral] *face: FACE_SOFT_SMILE* I want this to feel like a conversation, not a lecture. "
+        "[silence: 0.3] *gesture: PALMS_UP_1* Would you prefer a shorter question?"
+    ),
+]
+
+
+@dataclass
+class EngagementRepairRequest:
+    requested: bool = False
+    reason: str | None = None
+    score: float | None = None
+    drop: float | None = None
+    observed_for_seconds: float = 0.0
+
+
+def build_fallback_opening_annotated_response(candidate_profession: str) -> str:
     return (
         "[emotion: happiness] *face: FACE_SMILE_LOW* Hi, welcome. "
         "It is really nice to finally meet you. "
@@ -28,6 +69,19 @@ def build_opening_annotated_response(candidate_profession: str) -> str:
         f"[silence: 0.3] *gesture: EXPLAIN_BEAT_1* This interview will be focused on your career as {candidate_profession}. "
         "[silence: 0.4] *gesture: DEICTIC_YOU_1* How are you doing today?"
     )
+
+def build_opening_generation_instruction(candidate_profession: str) -> str:
+    return (
+        "[system_event: interview_start]\n"
+        f"The candidate's profession or field is: {candidate_profession}.\n"
+        "Generate Aera's first spoken turn of the interview.\n"
+        "This is the first turn, before the candidate has spoken.\n"
+        "Start warmly, introduce Aera and CCIA briefly, explain that this is a relaxed first conversation, "
+        "and ask how the candidate is doing today.\n"
+        "Do not ask about experience yet.\n"
+        "Output only one annotated response."
+    )
+
 
 def print_dialogue_output(output) -> None:
     print("\n" + "=" * 60)
@@ -96,6 +150,27 @@ def main() -> None:
     parser.add_argument("--engagement-fps", type=float, default=3.0)
     parser.add_argument("--fusion-fps", type=float, default=3.0)
     parser.add_argument("--show-engagement-window", action="store_true")
+
+    # Engagement watchdog while Aera is speaking.
+    # Current behaviour: because local playback is one blocking WAV, the watchdog
+    # can detect disengagement during playback but only triggers a repair after
+    # the current WAV returns.
+    parser.add_argument("--disable-engagement-watchdog", action="store_true")
+    parser.add_argument("--repair-threshold", type=float, default=0.30)
+    parser.add_argument("--repair-drop-threshold", type=float, default=0.25)
+    parser.add_argument("--repair-min-duration", type=float, default=1.2)
+    parser.add_argument("--repair-cooldown", type=float, default=8.0)
+    parser.add_argument("--engagement-monitor-interval", type=float, default=0.3)
+    parser.add_argument(
+        "--repair-response",
+        type=str,
+        default=None,
+        help=(
+            "Optional fixed annotated repair response. "
+            "If omitted, the system randomly chooses one response from "
+            "DEFAULT_REPAIR_ANNOTATED_RESPONSES."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -179,22 +254,196 @@ def main() -> None:
     )
 
     agent_speaking = False
+    last_repair_time: float | None = None
 
-    def play_agent_wav(wav_path: Path) -> None:
+    def play_agent_wav(
+        wav_path: Path,
+        *,
+        monitor_engagement: bool = True,
+        label: str = "agent_turn",
+    ) -> EngagementRepairRequest:
         """
-        Blocking local playback wrapper.
+        Blocking local playback wrapper with an engagement watchdog.
 
-        For Unreal integration, replace these assignments with the event/callback
-        Jordi exposes, for example: on_agent_speech_start / on_agent_speech_end.
+        Current local behaviour:
+        - The TTS API returns one complete WAV for the whole agent turn.
+        - play_wav_file(...) is blocking and does not expose a clean cancellation
+          hook here.
+        - Therefore, the watchdog can detect that engagement dropped while Aera
+          was speaking, but it can only trigger a repair immediately after the
+          current WAV finishes.
+
+        TODO for Unreal / chunked TTS integration:
+        When TTS or Unreal playback is split into sentence-level or
+        punctuation-level chunks, move this engagement check between chunks.
+        Before each chunk, read engagement.get_latest_score(); if engagement has
+        dropped below the repair threshold, skip the remaining chunks and send a
+        short interaction-repair utterance instead. That will turn the current
+        "repair after full WAV" behaviour into a real mid-turn change of plan.
+
+        For Unreal integration, replace the local agent_speaking assignments
+        with Jordi's event/callback layer, for example:
+        on_agent_speech_start / on_agent_speech_end.
         """
-        nonlocal agent_speaking
+        nonlocal agent_speaking, last_repair_time
+
+        repair_request = EngagementRepairRequest()
+        stop_monitor = threading.Event()
+        monitor_thread: threading.Thread | None = None
+
+        start_score = engagement.get_latest_score()
+        baseline_score = 0.5 if start_score is None else start_score
+
+        def monitor_engagement() -> None:
+            below_since: float | None = None
+            active_reason: str | None = None
+
+            while not stop_monitor.wait(args.engagement_monitor_interval):
+                current_score = engagement.get_latest_score()
+                if current_score is None:
+                    below_since = None
+                    active_reason = None
+                    continue
+
+                drop = baseline_score - current_score
+                absolute_low = current_score <= args.repair_threshold
+                rapid_drop = drop >= args.repair_drop_threshold
+
+                if absolute_low or rapid_drop:
+                    now = time.time()
+                    reason = "absolute_low" if absolute_low else "rapid_drop"
+
+                    if below_since is None or active_reason != reason:
+                        below_since = now
+                        active_reason = reason
+
+                    observed_for = now - below_since
+
+                    cooldown_ok = (
+                        last_repair_time is None
+                        or now - last_repair_time >= args.repair_cooldown
+                    )
+
+                    if observed_for >= args.repair_min_duration and cooldown_ok:
+                        repair_request.requested = True
+                        repair_request.reason = reason
+                        repair_request.score = current_score
+                        repair_request.drop = drop
+                        repair_request.observed_for_seconds = observed_for
+                        print(
+                            "\n[engagement-watchdog] Repair requested while Aera was speaking: "
+                            f"reason={reason}, score={current_score:.3f}, "
+                            f"drop={drop:.3f}, observed_for={observed_for:.1f}s",
+                            flush=True,
+                        )
+                        stop_monitor.set()
+                        return
+                else:
+                    below_since = None
+                    active_reason = None
+
         agent_speaking = True
-        print("agent_speaking=True")
+        print(f"agent_speaking=True ({label})")
+
+        if monitor_engagement and not args.disable_engagement_watchdog:
+            print(
+                "[engagement-watchdog] Monitoring engagement during Aera speech "
+                f"from baseline={baseline_score:.3f}",
+                flush=True,
+            )
+            monitor_thread = threading.Thread(
+                target=monitor_engagement,
+                daemon=True,
+            )
+            monitor_thread.start()
+
         try:
             play_wav_file(wav_path)
         finally:
+            stop_monitor.set()
+            if monitor_thread is not None:
+                monitor_thread.join(timeout=1.0)
+
             agent_speaking = False
-            print("agent_speaking=False")
+            print(f"agent_speaking=False ({label})")
+
+            if repair_request.requested:
+                last_repair_time = time.time()
+
+        return repair_request
+
+    def synthesize_and_play_repair(repair_request: EngagementRepairRequest) -> None:
+        """
+        Play a short fixed interaction-repair utterance after engagement drops.
+
+        This deliberately does not call Qwen: repair must be immediate, short,
+        predictable, and safe. After the repair, the normal loop returns to
+        listening mode so the candidate can answer.
+        """
+        if args.repair_response:
+            repair_annotated_response = args.repair_response
+        else:
+            repair_annotated_response = random.choice(DEFAULT_REPAIR_ANNOTATED_RESPONSES)
+
+        repair_output = parse_annotated_response(repair_annotated_response)
+
+        print("\nEngagement repair response:")
+        print_dialogue_output(repair_output)
+
+        repair_output_path = (
+            Path(tempfile.gettempdir())
+            / "dialogue_manager"
+            / "latest_engagement_repair_tts_output.wav"
+        )
+
+        try:
+            repair_tts_text = build_tts_api_text(repair_output)
+            print("\nRepair TTS API text:")
+            print(repair_tts_text)
+
+            repair_wav_path = tts_client.synthesize_to_file(
+                text=repair_tts_text,
+                output_path=repair_output_path,
+            )
+
+            print(f"Repair TTS WAV saved to: {repair_wav_path}")
+            print("Playing engagement repair message...")
+
+            play_agent_wav(
+                repair_wav_path,
+                monitor_engagement=False,
+                label="engagement_repair",
+            )
+
+            pipeline.state.add_turn(
+                DialogueTurn(
+                    user_input=UserTurnInput(
+                        user_text=(
+                            "[system_event] Engagement dropped while Aera was speaking; "
+                            "Aera made a brief interaction-repair move."
+                        )
+                    ),
+                    engagement=EngagementState(
+                        score=repair_request.score if repair_request.score is not None else 0.5,
+                        summary="Engagement repair triggered during agent speech.",
+                        metadata={
+                            "source": "engagement_watchdog",
+                            "reason": repair_request.reason,
+                            "drop": repair_request.drop,
+                            "observed_for_seconds": repair_request.observed_for_seconds,
+                        },
+                    ),
+                    output=repair_output,
+                    raw_llm_output=repair_annotated_response,
+                    metadata={
+                        "type": "engagement_repair",
+                    },
+                )
+            )
+
+        except Exception as exc:
+            print("\nERROR while generating or playing engagement repair audio:")
+            print(exc)
 
     print("\nVoice dialogue pipeline ready.")
     print("Aera will start the interview.")
@@ -202,8 +451,55 @@ def main() -> None:
     print("Press Ctrl+C to quit.")
     print("Speak in English after Aera's first question.\n")
 
-    opening_annotated_response = build_opening_annotated_response(candidate_profession)
-    opening_output = parse_annotated_response(opening_annotated_response)
+    opening_generation_text = build_opening_generation_instruction(candidate_profession)
+    opening_engagement_score = engagement.get_latest_score()
+
+    try:
+        print("\nGenerating Aera's opening turn with Qwen...")
+
+        opening_output = pipeline.process_text_turn(
+            opening_generation_text,
+            engagement_score=opening_engagement_score,
+        )
+
+        opening_annotated_response = opening_output.annotated_response
+
+    except Exception as exc:
+        print("\nWARNING: Could not generate opening turn with Qwen.")
+        print("Using fallback hard-coded opening.")
+        print(exc)
+
+        opening_annotated_response = build_fallback_opening_annotated_response(
+            candidate_profession
+        )
+        opening_output = parse_annotated_response(opening_annotated_response)
+
+        pipeline.state.add_turn(
+            DialogueTurn(
+                user_input=UserTurnInput(
+                    user_text=(
+                        "[system_event: interview_start_fallback]\n"
+                        f"Candidate profession / field: {candidate_profession}\n"
+                        "Aera used the fallback opening response."
+                    )
+                ),
+                engagement=EngagementState(
+                    score=opening_engagement_score if opening_engagement_score is not None else 0.5,
+                    summary="Opening turn generated from fallback.",
+                    metadata={
+                        "source": "agent_opening_fallback",
+                        "ready": opening_engagement_score is not None,
+                    },
+                ),
+                output=opening_output,
+                raw_llm_output=opening_annotated_response,
+                metadata={
+                    "type": "agent_opening",
+                    "candidate_profession": candidate_profession,
+                    "fallback": True,
+                },
+            )
+        )
 
     print_dialogue_output(opening_output)
 
@@ -229,42 +525,14 @@ def main() -> None:
         print(f"TTS WAV saved to: {wav_path}")
         print("Playing Aera's opening message...")
 
-        play_agent_wav(wav_path)
+        play_agent_wav(wav_path, monitor_engagement=False, label="opening")
 
     except Exception as exc:
         agent_speaking = False
         print("\nERROR while generating or playing opening TTS audio:")
         print(exc)
 
-    # Store the opening in dialogue history so Qwen knows the interview has already started.
-    opening_turn = DialogueTurn(
-        user_input=UserTurnInput(
-            user_text=(
-                "[session_start]\n"
-                f"Candidate profession / field: {candidate_profession}\n"
-                "Aera must adapt the interview to this professional field. "
-                "Do not assume the candidate is a computational linguist unless this profession was explicitly provided."
-            )
-        ),
-        engagement=EngagementState(
-            score=0.5,
-            summary="Opening turn before candidate response; neutral engagement.",
-            metadata={
-                "source": "agent_opening",
-                "ready": False,
-            },
-        ),
-        output=opening_output,
-        raw_llm_output=opening_annotated_response,
-        metadata={
-            "type": "agent_opening",
-            "candidate_profession": candidate_profession,
-        },
-    )
-
-    pipeline.state.add_turn(opening_turn)
-
-    print("\nAera finished speaking. Listening...")
+    print("\nAera finished speaking. Listening is now automatic.")
 
     engagement_warning_printed = False
 
@@ -366,7 +634,14 @@ def main() -> None:
                 print(f"TTS WAV saved to: {wav_path}")
                 print("Playing TTS audio...")
 
-                play_agent_wav(wav_path)
+                repair_request = play_agent_wav(
+                    wav_path,
+                    monitor_engagement=True,
+                    label="agent_turn",
+                )
+
+                if repair_request.requested:
+                    synthesize_and_play_repair(repair_request)
 
             except Exception as exc:
                 agent_speaking = False

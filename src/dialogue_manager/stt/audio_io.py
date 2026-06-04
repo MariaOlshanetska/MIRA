@@ -65,6 +65,7 @@ def record_microphone_to_file(
 
     print(f"Audio saved to: {output_path}")
 
+
 def record_microphone_until_silence(
     output_path: Path,
     sample_rate: int = 16000,
@@ -154,6 +155,7 @@ def record_microphone_until_silence(
     sf.write(output_path, audio, sample_rate)
 
     print(f"Audio saved to: {output_path}")
+
 
 def wait_for_speech_then_record_until_silence(
     output_path: Path,
