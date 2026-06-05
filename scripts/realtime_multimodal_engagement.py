@@ -38,7 +38,6 @@ import queue
 import sys
 import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Any
 from dataclasses import dataclass, field
@@ -49,11 +48,10 @@ import sounddevice as sd
 import yaml
 import parselmouth
 from collections import deque
-from dataclasses import dataclass, field
 
 
 CONFIG_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "config", "00-defaults.yml"
+    os.path.dirname(__file__), "..", "configs", "00-defaults.yml"
 )
 
 FIELD_ORDER = (
@@ -77,6 +75,42 @@ ALLOWED_LABELS = {
 }
 
 EPS = 1e-6
+
+@dataclass
+class Baseline:
+    f0: float
+    intensity: float
+    rhythm: float
+
+@dataclass
+class ProsodyFeatures:
+    f0: float
+    intensity: float      # Parselmouth intensity, roughly dB SPL-like scale
+    rhythm: float         # std of Parselmouth intensity contour, in dB
+    rms: float            # waveform RMS, used for silence detection
+    voiced_ratio: float   # proportion of pitch frames with f0 > 0
+
+
+@dataclass
+class VisualFeatures:
+    gaze: Optional[str]
+    torso_position: Optional[str]
+    feet_pointing: Optional[str]
+    crossed_arms: Optional[str]
+    sleepy_eyes: Optional[str]
+    smile: Optional[str]
+    eyebrow_raise: Optional[str]
+    raw: str
+    ok: bool
+    timestamp: float = 0.0
+    status_code: Optional[int] = None
+    latency: Optional[float] = None
+
+
+@dataclass
+class EngagementState:
+    z: float
+    e: float
 
 @dataclass
 class RoleGazeTracker:
@@ -188,43 +222,6 @@ class RoleGazeTracker:
 
         score = float(np.clip(score, -1.0, 1.0))
         return float(ratio), float(threshold), float(den), bool(engaged), score
-
-@dataclass
-class Baseline:
-    f0: float
-    intensity: float
-    rhythm: float
-
-
-@dataclass
-class ProsodyFeatures:
-    f0: float
-    intensity: float      # Parselmouth intensity, roughly dB SPL-like scale
-    rhythm: float         # std of Parselmouth intensity contour, in dB
-    rms: float            # waveform RMS, used for silence detection
-    voiced_ratio: float   # proportion of pitch frames with f0 > 0
-
-
-@dataclass
-class VisualFeatures:
-    gaze: Optional[str]
-    torso_position: Optional[str]
-    feet_pointing: Optional[str]
-    crossed_arms: Optional[str]
-    sleepy_eyes: Optional[str]
-    smile: Optional[str]
-    eyebrow_raise: Optional[str]
-    raw: str
-    ok: bool
-    timestamp: float = 0.0
-    status_code: Optional[int] = None
-    latency: Optional[float] = None
-
-
-@dataclass
-class EngagementState:
-    z: float
-    e: float
 
 
 def load_config_url() -> Optional[str]:
@@ -362,7 +359,7 @@ def score_crossed_arms(label: Optional[str]) -> Optional[float]:
 def score_sleepy_eyes(label: Optional[str]) -> Optional[float]:
     lab = normalize_label(label)
     if lab == "yes":
-    # Ojos sleepy deberían hundir más que una señal corporal ambigua.
+        # Sleepy eyes should have stronger negative evidence than ambiguous posture.
         return -1.65
     if lab == "no":
         return 0.0
@@ -386,6 +383,10 @@ def score_eyebrow_raise(label: Optional[str]) -> Optional[float]:
         return 0.0
     return None
 
+# NOTE:
+# This accumulator implements a heuristic, prototype-level fusion model.
+# Weights are hand-tuned for real-time demonstration and should not be interpreted
+# as validated psychological coefficients. User-based validation is required.
 
 class EngagementAccumulator:
     def __init__(
