@@ -52,6 +52,18 @@ def build_user_prompt(request: LLMRequest) -> str:
     if not recent_history:
         recent_history = "[No previous dialogue history.]"
 
+    candidate_profession = request.state.variables.get(
+        "candidate_profession",
+        "the candidate's stated profession or field",
+    )
+
+    opening_delivered = bool(request.state.variables.get("opening_delivered", False))
+    opening_status = (
+        "Aera has already introduced herself and CCIA."
+        if opening_delivered
+        else "Aera has not introduced herself yet."
+    )
+
     engagement_score = request.engagement.score
     if engagement_score is None:
         engagement_score_text = "0.500"
@@ -60,6 +72,13 @@ def build_user_prompt(request: LLMRequest) -> str:
 
     return f"""
 You are generating the next response in an ongoing live interview.
+
+Session context:
+- Candidate profession or field: {candidate_profession}
+- Opening status: {opening_status}
+
+Use the candidate profession or field as the concrete domain of the interview.
+Do not replace it with generic examples such as “software developer” unless that is the actual profession.
 
 Recent dialogue history, for context only:
 {recent_history}
@@ -76,42 +95,16 @@ MOST RECENT USER INPUT:
 Your highest-priority task:
 Respond to the MOST RECENT USER INPUT directly.
 
-Dialogue style and continuity rules:
-
+Turn-local priorities:
 * The most recent user input has priority over the interview agenda.
-* Sound like a real person in a live conversation, not like a questionnaire or a dialogue system.
-* React to the candidate’s actual words before moving on. Use specific references to what they just said instead of generic acknowledgements.
-* Prefer natural transitions such as “Right, I see”, “That makes sense”, “Oh, interesting”, “I like that”, “Okay, let me ask it this way”, or “That is a good point”.
-* Do not use the same response pattern every turn. Avoid always doing: acknowledgement + follow-up question.
-* It is okay to use small human-like hesitation or thinking moves when natural, such as “Hmm”, “Let me think”, “Actually”, “I mean”, or “Maybe I can ask that differently”.
-* Keep the conversation warm and lightly informal, while still sounding professional.
-* Do not over-explain the interview process unless the candidate seems confused.
-* Do not repeat previous greetings.
-* Do not restart the interview.
-* Do not keep asking the same question if the candidate already answered it.
+* Do not repeat previous greetings or introductions.
+* Do not introduce yourself again after the opening.
+* Do not repeat that this is a relaxed conversation after the opening.
+* Do not repeat any sentence or clause from the previous Agent turn.
+* Use recent history only for continuity and to avoid repetition.
+* If the candidate asks “How are you?” after the opening, answer briefly and warmly, then move forward to the first interview topic. Do not introduce yourself again.
 * If the candidate asks a question, answer it briefly first, then continue naturally.
 * If the candidate gives a short or unclear answer, do not pressure them immediately. Try a gentler rephrasing or offer an example.
 * Ask only one main question at a time.
-* Keep responses relatively concise, but not robotic. A natural short response may include a reaction, a transition, and one question.
-* Avoid corporate, scripted, or impersonal phrases such as “Thank you for your response”, “I will now proceed”, “That is valuable information”, or “Please elaborate”.
-* Do not mention that you are an AI, an agent, a system, or that you are following instructions.
-
-Annotation rules:
-
-* Output only one annotated response.
-* Use square brackets [] for TTS annotations.
-* Use asterisks *channel: name* for Unreal annotations.
-* Use only Unreal annotation names listed in the Unreal gesture library.
-* Do not invent Unreal annotation names.
-* Do not invent TTS burst names.
-* Do not output JSON.
-* Do not explain the annotations.
-* Use [emotion: happiness], [emotion: angry], [emotion: sad], [emotion: neutral], or [emotion: whisper] for TTS emotion.
-* Use [silence: seconds] for TTS silences.
-* Place every TTS, face, and gesture annotation immediately BEFORE the words it should affect.
-* Never place a gesture annotation after the sentence it is meant to accompany.
-* Use [burst: burst_name] only when clearly appropriate.
-* Use facial expressions and gestures sparingly. They should support the interaction, not decorate every sentence.
-* Prefer low-intensity expressions for natural conversation, such as *face: FACE_SOFT_SMILE*, *face: FACE_SMILE_LOW*, or *face: FACE_CONFUSED_LOW*.
-
+* Follow the system prompt, response format, and annotation libraries exactly.
 """.strip()

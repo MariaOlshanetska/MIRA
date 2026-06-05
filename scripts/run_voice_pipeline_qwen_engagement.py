@@ -38,7 +38,7 @@ DEFAULT_REPAIR_ANNOTATED_RESPONSES = [
         "[silence: 0.3] *face: FACE_SOFT_SMILE* Are you still with me?"
     ),
     (
-        "[emotion: neutral] *face: FACE_CONFUSED_LOW* I feel like I am loosing you. "
+        "[emotion: neutral] *face: FACE_CONFUSED_LOW* I feel like I am losing you. "
         "[silence: 0.3] *gesture: PALMS_UP_1* Should I rephrase the question?"
     ),
     (
@@ -63,11 +63,10 @@ class EngagementRepairRequest:
 
 def build_fallback_opening_annotated_response(candidate_profession: str) -> str:
     return (
-        "[emotion: happiness] *face: FACE_SMILE_LOW* Hi, welcome. "
-        "It is really nice to finally meet you. "
-        "[silence: 0.3] *gesture: DEICTIC_ME_1* My name is Aera, and I will be guiding this first conversation today. "
-        f"[silence: 0.3] *gesture: EXPLAIN_BEAT_1* This interview will be focused on your career as {candidate_profession}. "
-        "[silence: 0.4] *gesture: DEICTIC_YOU_1* How are you doing today?"
+        "[emotion: happiness] *face: FACE_SMILE_LOW* Hello, it is lovely to meet you. "
+        "[silence: 0.3] *gesture: DEICTIC_ME_1* I am Aera, and I will be guiding this first conversation for CCIA. "
+        f"[silence: 0.3] *gesture: EXPLAIN_BEAT_1* We will keep it relaxed and talk a little about your path as {candidate_profession}. "
+        "[silence: 0.4] *gesture: PALMS_UP_1* Before we start, how are you feeling today?"
     )
 
 def build_opening_generation_instruction(candidate_profession: str) -> str:
@@ -76,9 +75,12 @@ def build_opening_generation_instruction(candidate_profession: str) -> str:
         f"The candidate's profession or field is: {candidate_profession}.\n"
         "Generate Aera's first spoken turn of the interview.\n"
         "This is the first turn, before the candidate has spoken.\n"
-        "Start warmly, introduce Aera and CCIA briefly, explain that this is a relaxed first conversation, "
-        "and ask how the candidate is doing today.\n"
-        "Do not ask about experience yet.\n"
+        "Keep it short: two spoken sentences maximum.\n"
+        "Include a warm greeting, Aera's name, CCIA, and a light check-in.\n"
+        "You may briefly mention the candidate's field, but do not ask about experience yet.\n"
+        "Do not say 'no formal checklists', 'scripted assessment', or similar meta-comments.\n"
+        "Do not over-explain the interview process.\n"
+        "Do not copy examples from the system prompt word-for-word.\n"
         "Output only one annotated response."
     )
 
@@ -252,6 +254,8 @@ def main() -> None:
         engagement_analyzer=engagement,
         llm_client=llm_client,
     )
+    pipeline.state.variables["candidate_profession"] = candidate_profession
+    pipeline.state.variables["opening_delivered"] = False
 
     agent_speaking = False
     last_repair_time: float | None = None
@@ -531,6 +535,8 @@ def main() -> None:
         agent_speaking = False
         print("\nERROR while generating or playing opening TTS audio:")
         print(exc)
+
+    pipeline.state.variables["opening_delivered"] = True
 
     print("\nAera finished speaking. Listening is now automatic.")
 

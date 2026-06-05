@@ -36,16 +36,69 @@ class DialogueState(BaseModel):
     def recent_turns(self, limit: int = 5) -> list[DialogueTurn]:
         return self.turns[-limit:]
 
+    def _compact_system_event_as_text(self, turn: DialogueTurn) -> str | None:
+        """
+        Render internal system events compactly for the prompt.
+
+        We deliberately do not expose the full synthetic system-event user text,
+        because Qwen may treat it as a real candidate utterance. We also avoid
+        replaying the full opening response, because that makes the next turn
+        more likely to repeat Aera's introduction.
+        """
+
+        user_text = turn.user_input.user_text.strip()
+        turn_type = turn.metadata.get("type")
+
+        if user_text.startswith("[system_event: interview_start]"):
+            return (
+                "Session state: Aera has already opened the interview, "
+                "introduced herself and CCIA, framed the conversation as relaxed, "
+                "and asked the candidate how they are doing. Do not repeat the opening."
+            )
+
+        if user_text.startswith("[system_event: interview_start_fallback]"):
+            return (
+                "Session state: Aera has already opened the interview with a fallback opening. "
+                "Do not repeat the opening, self-introduction, or CCIA framing."
+            )
+
+        if turn_type == "agent_opening":
+            return (
+                "Session state: Aera has already introduced herself and started the interview. "
+                "Do not repeat the opening."
+            )
+
+        if turn_type == "engagement_repair" or "Engagement dropped" in user_text:
+            return (
+                "System event: Aera made a brief interaction-repair move because engagement dropped "
+                "while she was speaking. Continue from the candidate's next response."
+            )
+
+        if user_text.startswith("[system_event"):
+            return "System event: internal dialogue state updated."
+
+        return None
+
     def recent_history_as_text(self, limit: int = 5) -> str:
         """
         Compact text representation for prompts.
+
+        System events are summarized instead of shown verbatim. This prevents the
+        LLM from repeating opening instructions or treating internal events as
+        candidate speech.
         """
 
         recent = self.recent_turns(limit=limit)
         lines: list[str] = []
 
         for turn in recent:
-            lines.append(f"User: {turn.user_input.user_text}")
-            lines.append(f"Agent: {turn.output.response_text}")
+            system_line = self._compact_system_event_as_text(turn)
+            if system_line is not None:
+                if system_line not in lines:
+                    lines.append(system_line)
+                continue
+
+            lines.append(f"Candidate: {turn.user_input.user_text}")
+            lines.append(f"Aera: {turn.output.response_text}")
 
         return "\n".join(lines)

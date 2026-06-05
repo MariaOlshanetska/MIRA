@@ -9,8 +9,12 @@ ALLOWED_TTS_EMOTIONS = {
     "happiness",
     "angry",
     "sad",
-    "neutre",
+    "neutral",
     "whisper",
+}
+
+TTS_EMOTION_ALIASES = {
+    "neutre": "neutral",
 }
 
 
@@ -39,6 +43,11 @@ def _parse_annotation_content(content: str) -> tuple[str, str | None]:
     return name.strip().lower(), value.strip()
 
 
+def _normalise_emotion(value: str) -> str:
+    emotion = value.strip().lower()
+    return TTS_EMOTION_ALIASES.get(emotion, emotion)
+
+
 def _tts_annotation_to_api_tag(content: str) -> str:
     name, value = _parse_annotation_content(content)
 
@@ -46,15 +55,17 @@ def _tts_annotation_to_api_tag(content: str) -> str:
         if value is None:
             return ""
 
-        emotion = value.strip().lower()
+        emotion = _normalise_emotion(value)
 
         if emotion not in ALLOWED_TTS_EMOTIONS:
             return ""
 
         return f"<emotion({emotion})>"
 
-    if name in ALLOWED_TTS_EMOTIONS and value is None:
-        return f"<emotion({name})>"
+    if value is None:
+        emotion = _normalise_emotion(name)
+        if emotion in ALLOWED_TTS_EMOTIONS:
+            return f"<emotion({emotion})>"
 
     if name in {"pause", "silence"}:
         if value is None:
@@ -86,10 +97,10 @@ def build_tts_api_text(output: DialogueManagerOutput) -> str:
     Convert the LLM annotated response into the exact format expected by the TTS API.
 
     Example input:
-        [emotion: sad] Hello [pause: 0.5] there *face: smile*.
+        [emotion: neutral] Hello [silence: 0.5] there *face: FACE_SOFT_SMILE*.
 
     Example output:
-        <emotion(sad)> Hello <silence(0.5)> there.
+        <emotion(neutral)> Hello <silence(0.5)> there.
     """
 
     text = output.annotated_response
