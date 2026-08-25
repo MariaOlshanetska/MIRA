@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import random
+import sys
 import tempfile
 import threading
 import time
@@ -18,36 +18,53 @@ from dialogue_manager.tts.formatter import build_tts_api_text
 from dialogue_manager.core.turn import DialogueTurn, UserTurnInput
 from dialogue_manager.output.annotation_parser import parse_annotated_response
 
-from dialogue_manager.tts.audio_player import play_wav_file
+from dialogue_manager.tts.audio_player import play_wav_file, play_wav_file_interruptible
 from dialogue_manager.tts.expressive_client import ExpressiveTTSClient
 
 
 DEFAULT_ENGAGEMENT_URL = "http://10.10.200.182/engagement_maria/engagement_maria"
 
-DEFAULT_REPAIR_ANNOTATED_RESPONSES = [
+# =============================================================================
+# 3-STRIKE REPAIR SYSTEM
+# =============================================================================
+# When engagement drops below the repair threshold while Aera is speaking,
+# the system triggers an escalating repair:
+#
+# Strike 1: Soft check-in — "Is everything okay?"
+# Strike 2: Firmer notice — "I feel like you are not very present right now."
+# Strike 3: End conversation gracefully and close the session.
+#
+# After each strike, a cooldown period (default 15s) must pass before the
+# next strike can be triggered.
+# =============================================================================
+
+STRIKE_RESPONSES = [
+    # Strike 1 — Soft, friendly check-in
+    # (Preceded by a thinking burst after the mid-speech interruption)
     (
-        "[emotion: neutral] *face: FACE_SOFT_SMILE* Let me pause there for a second. "
-        "[silence: 0.3] *gesture: PALMS_UP_1* Is everything okay, or would you like me to rephrase?"
+        "[silence: 0.4] [burst: sight_1] [silence: 0.3] "
+        "[emotion: neutral] *face: FACE_SOFT_SMILE* *gesture: EMBLEM_WAIT_HOLDON_2* "
+        "Let me pause for a second. [silence: 0.3] "
+        "*gesture: DEICTIC_YOU_1* Is everything okay? [silence: 0.2] "
+        "*gesture: PALMS_UP_1* We can slow down if you need."
     ),
+    # Strike 2 — Firmer, still professional
     (
-        "[emotion: neutral] *face: FACE_CONFUSED_LOW* I might be going a bit too fast. "
-        "[silence: 0.3] *gesture: PALMS_UP_1* Would you like me to slow down or ask that differently?"
+        "[silence: 0.4] [burst: sight_2] [silence: 0.3] "
+        "[emotion: neutral] *face: FACE_CONFUSED_LOW* *gesture: EMBLEM_WAIT_HOLDON_2* "
+        "I am going to stop here for a moment. [silence: 0.3] "
+        "*face: FACE_FRUSTRATED* I feel like you are not very present right now. [silence: 0.3] "
+        "*gesture: PALMS_UP_1* Should we continue, or would you prefer to take a break?"
     ),
+    # Strike 3 — Graceful end of conversation
     (
-        "[emotion: neutral] *gesture: EMBLEM_WAIT_HOLDON_2* Let me stop there for a moment. "
-        "[silence: 0.3] *face: FACE_SOFT_SMILE* Are you still with me?"
-    ),
-    (
-        "[emotion: neutral] *face: FACE_CONFUSED_LOW* I feel like I am losing you. "
-        "[silence: 0.3] *gesture: PALMS_UP_1* Should I rephrase the question?"
-    ),
-    (
-        "[emotion: neutral] *gesture: EMBLEM_WAIT_HOLDON_2* Let me pause the interview for a second. "
-        "[silence: 0.3] *gesture: DEICTIC_YOU_1* Are you okay to continue?"
-    ),
-    (
-        "[emotion: neutral] *face: FACE_SOFT_SMILE* I want this to feel like a conversation, not a lecture. "
-        "[silence: 0.3] *gesture: PALMS_UP_1* Would you prefer a shorter question?"
+        "[silence: 0.4] [burst: sight_3] [silence: 0.3] "
+        "[emotion: neutral] *face: FACE_SOFT_SMILE* *gesture: EMBLEM_WAIT_HOLDON_2* "
+        "Okay, I think this is a good moment to wrap up. [silence: 0.3] "
+        "*gesture: EXPLAIN_BEAT_1* It seems like today might not be the best time for this. "
+        "[silence: 0.3] *face: FACE_SMILE_LOW* *gesture: QUICK_NOD_1* "
+        "No worries at all, we can always pick this up another day. [silence: 0.2] "
+        "*gesture: DEICTIC_YOU_1* Take care."
     ),
 ]
 
@@ -63,11 +80,14 @@ class EngagementRepairRequest:
 
 def build_fallback_opening_annotated_response(candidate_profession: str) -> str:
     return (
-        "[emotion: happiness] *face: FACE_SMILE_LOW* Hello, it is lovely to meet you. "
-        "[silence: 0.3] *gesture: DEICTIC_ME_1* I am Aera, and I will be guiding this first conversation for CCIA. "
-        f"[silence: 0.3] *gesture: EXPLAIN_BEAT_1* We will keep it relaxed and talk a little about your path as {candidate_profession}. "
-        "[silence: 0.4] *gesture: PALMS_UP_1* Before we start, how are you feeling today?"
+        "[emotion: happiness] *face: FACE_SMILE_LOW* Hey, welcome! "
+        "*gesture: DEICTIC_ME_1* I am Aera, part of the team here at CCIA. "
+        f"[silence: 0.3] *gesture: EXPLAIN_BEAT_1* We are going to keep this super relaxed, "
+        f"just a short chat about your work in {candidate_profession}. "
+        "[silence: 0.3] *face: FACE_SOFT_SMILE* *gesture: DEICTIC_YOU_1* "
+        "So, how are you doing today?"
     )
+
 
 def build_opening_generation_instruction(candidate_profession: str) -> str:
     return (
@@ -75,9 +95,10 @@ def build_opening_generation_instruction(candidate_profession: str) -> str:
         f"The candidate's profession or field is: {candidate_profession}.\n"
         "Generate Aera's first spoken turn of the interview.\n"
         "This is the first turn, before the candidate has spoken.\n"
-        "Keep it short: two spoken sentences maximum.\n"
+        "Keep it short: two or three spoken sentences maximum.\n"
         "Include a warm greeting, Aera's name, CCIA, and a light check-in.\n"
         "You may briefly mention the candidate's field, but do not ask about experience yet.\n"
+        "Use at least one facial expression and one gesture.\n"
         "Do not say 'no formal checklists', 'scripted assessment', or similar meta-comments.\n"
         "Do not over-explain the interview process.\n"
         "Do not copy examples from the system prompt word-for-word.\n"
@@ -118,7 +139,9 @@ def print_dialogue_output(output) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Voice dialogue pipeline with Qwen LLM and engagement monitoring.",
+    )
 
     parser.add_argument("--list-devices", action="store_true")
 
@@ -143,7 +166,7 @@ def main() -> None:
     parser.add_argument(
         "--engagement-script",
         type=str,
-        default="scripts/realtime_multimodal_engagement.py",
+        default="scripts/realtime_engagement_demo.py",
     )
     parser.add_argument("--engagement-url", type=str, default=DEFAULT_ENGAGEMENT_URL)
     parser.add_argument("--camera", type=int, default=0)
@@ -153,26 +176,17 @@ def main() -> None:
     parser.add_argument("--fusion-fps", type=float, default=3.0)
     parser.add_argument("--show-engagement-window", action="store_true")
 
-    # Engagement watchdog while Aera is speaking.
-    # Current behaviour: because local playback is one blocking WAV, the watchdog
-    # can detect disengagement during playback but only triggers a repair after
-    # the current WAV returns.
+    # Engagement watchdog (3-strike system)
     parser.add_argument("--disable-engagement-watchdog", action="store_true")
-    parser.add_argument("--repair-threshold", type=float, default=0.30)
-    parser.add_argument("--repair-drop-threshold", type=float, default=0.25)
-    parser.add_argument("--repair-min-duration", type=float, default=1.2)
-    parser.add_argument("--repair-cooldown", type=float, default=8.0)
+    parser.add_argument("--repair-threshold", type=float, default=0.20,
+                        help="Engagement score below which a strike is triggered")
+    parser.add_argument("--repair-drop-threshold", type=float, default=0.25,
+                        help="Rapid drop from baseline that also triggers a strike")
+    parser.add_argument("--repair-min-duration", type=float, default=1.2,
+                        help="Seconds engagement must stay low before triggering strike")
+    parser.add_argument("--repair-cooldown", type=float, default=15.0,
+                        help="Minimum seconds between consecutive strikes")
     parser.add_argument("--engagement-monitor-interval", type=float, default=0.3)
-    parser.add_argument(
-        "--repair-response",
-        type=str,
-        default=None,
-        help=(
-            "Optional fixed annotated repair response. "
-            "If omitted, the system randomly chooses one response from "
-            "DEFAULT_REPAIR_ANNOTATED_RESPONSES."
-        ),
-    )
 
     args = parser.parse_args()
 
@@ -257,8 +271,13 @@ def main() -> None:
     pipeline.state.variables["candidate_profession"] = candidate_profession
     pipeline.state.variables["opening_delivered"] = False
 
+    # =========================================================================
+    # 3-STRIKE STATE
+    # =========================================================================
     agent_speaking = False
-    last_repair_time: float | None = None
+    strike_count = 0          # 0 = no strikes yet, max = 3
+    last_strike_time: float | None = None
+    session_ended = False     # Set to True after strike 3 → exit main loop
 
     def play_agent_wav(
         wav_path: Path,
@@ -267,38 +286,23 @@ def main() -> None:
         label: str = "agent_turn",
     ) -> EngagementRepairRequest:
         """
-        Blocking local playback wrapper with an engagement watchdog.
+        Interruptible playback wrapper with engagement watchdog.
 
-        Current local behaviour:
-        - The TTS API returns one complete WAV for the whole agent turn.
-        - play_wav_file(...) is blocking and does not expose a clean cancellation
-          hook here.
-        - Therefore, the watchdog can detect that engagement dropped while Aera
-          was speaking, but it can only trigger a repair immediately after the
-          current WAV finishes.
-
-        TODO for Unreal / chunked TTS integration:
-        When TTS or Unreal playback is split into sentence-level or
-        punctuation-level chunks, move this engagement check between chunks.
-        Before each chunk, read engagement.get_latest_score(); if engagement has
-        dropped below the repair threshold, skip the remaining chunks and send a
-        short interaction-repair utterance instead. That will turn the current
-        "repair after full WAV" behaviour into a real mid-turn change of plan.
-
-        For Unreal integration, replace the local agent_speaking assignments
-        with Jordi's event/callback layer, for example:
-        on_agent_speech_start / on_agent_speech_end.
+        Uses play_wav_file_interruptible() so that when the watchdog detects
+        an engagement drop, it can STOP playback mid-audio. Aera literally
+        stops talking, pauses briefly, and then the strike fires.
         """
-        nonlocal agent_speaking, last_repair_time
+        nonlocal agent_speaking, last_strike_time
 
         repair_request = EngagementRepairRequest()
+        stop_playback = threading.Event()   # Set this to halt audio immediately
         stop_monitor = threading.Event()
         monitor_thread: threading.Thread | None = None
 
         start_score = engagement.get_latest_score()
         baseline_score = 0.5 if start_score is None else start_score
 
-        def monitor_engagement() -> None:
+        def _monitor_engagement_loop() -> None:
             below_since: float | None = None
             active_reason: str | None = None
 
@@ -324,8 +328,8 @@ def main() -> None:
                     observed_for = now - below_since
 
                     cooldown_ok = (
-                        last_repair_time is None
-                        or now - last_repair_time >= args.repair_cooldown
+                        last_strike_time is None
+                        or now - last_strike_time >= args.repair_cooldown
                     )
 
                     if observed_for >= args.repair_min_duration and cooldown_ok:
@@ -335,11 +339,13 @@ def main() -> None:
                         repair_request.drop = drop
                         repair_request.observed_for_seconds = observed_for
                         print(
-                            "\n[engagement-watchdog] Repair requested while Aera was speaking: "
+                            f"\n[engagement-watchdog] Strike trigger — INTERRUPTING playback! "
                             f"reason={reason}, score={current_score:.3f}, "
                             f"drop={drop:.3f}, observed_for={observed_for:.1f}s",
                             flush=True,
                         )
+                        # Stop playback immediately
+                        stop_playback.set()
                         stop_monitor.set()
                         return
                 else:
@@ -351,18 +357,25 @@ def main() -> None:
 
         if monitor_engagement and not args.disable_engagement_watchdog:
             print(
-                "[engagement-watchdog] Monitoring engagement during Aera speech "
-                f"from baseline={baseline_score:.3f}",
+                f"[engagement-watchdog] Monitoring during Aera speech "
+                f"(baseline={baseline_score:.3f}, strikes={strike_count}/3)",
                 flush=True,
             )
             monitor_thread = threading.Thread(
-                target=monitor_engagement,
+                target=_monitor_engagement_loop,
                 daemon=True,
             )
             monitor_thread.start()
 
         try:
-            play_wav_file(wav_path)
+            if monitor_engagement and not args.disable_engagement_watchdog:
+                # Interruptible playback — stops if stop_playback is set
+                completed = play_wav_file_interruptible(wav_path, stop_playback)
+                if not completed:
+                    print(f"[playback] Audio interrupted mid-speech ({label})")
+            else:
+                # Non-interruptible for strikes/opening (no watchdog)
+                play_wav_file(wav_path)
         finally:
             stop_monitor.set()
             if monitor_thread is not None:
@@ -372,86 +385,109 @@ def main() -> None:
             print(f"agent_speaking=False ({label})")
 
             if repair_request.requested:
-                last_repair_time = time.time()
+                last_strike_time = time.time()
 
         return repair_request
 
-    def synthesize_and_play_repair(repair_request: EngagementRepairRequest) -> None:
+    def execute_strike(repair_request: EngagementRepairRequest) -> None:
         """
-        Play a short fixed interaction-repair utterance after engagement drops.
+        Execute the next strike in the escalating repair system.
 
-        This deliberately does not call Qwen: repair must be immediate, short,
-        predictable, and safe. After the repair, the normal loop returns to
-        listening mode so the candidate can answer.
+        Strike 1: Soft check-in
+        Strike 2: Firmer warning
+        Strike 3: End conversation and set session_ended = True
         """
-        if args.repair_response:
-            repair_annotated_response = args.repair_response
-        else:
-            repair_annotated_response = random.choice(DEFAULT_REPAIR_ANNOTATED_RESPONSES)
+        nonlocal strike_count, session_ended
 
-        repair_output = parse_annotated_response(repair_annotated_response)
+        strike_count += 1
+        strike_index = min(strike_count - 1, len(STRIKE_RESPONSES) - 1)
+        strike_annotated_response = STRIKE_RESPONSES[strike_index]
 
-        print("\nEngagement repair response:")
-        print_dialogue_output(repair_output)
+        print(f"\n{'='*60}")
+        print(f"STRIKE {strike_count} / 3")
+        print(f"{'='*60}")
+        print(f"Reason: {repair_request.reason}")
+        print(f"Score at trigger: {repair_request.score:.3f}" if repair_request.score else "")
+        print(f"{'='*60}")
 
-        repair_output_path = (
+        strike_output = parse_annotated_response(strike_annotated_response)
+        print_dialogue_output(strike_output)
+
+        strike_wav_path = (
             Path(tempfile.gettempdir())
             / "dialogue_manager"
-            / "latest_engagement_repair_tts_output.wav"
+            / f"strike_{strike_count}_tts_output.wav"
         )
 
         try:
-            repair_tts_text = build_tts_api_text(repair_output)
-            print("\nRepair TTS API text:")
-            print(repair_tts_text)
+            strike_tts_text = build_tts_api_text(strike_output)
+            print(f"\nStrike {strike_count} TTS text:")
+            print(strike_tts_text)
 
-            repair_wav_path = tts_client.synthesize_to_file(
-                text=repair_tts_text,
-                output_path=repair_output_path,
+            wav_path = tts_client.synthesize_to_file(
+                text=strike_tts_text,
+                output_path=strike_wav_path,
             )
 
-            print(f"Repair TTS WAV saved to: {repair_wav_path}")
-            print("Playing engagement repair message...")
+            print(f"Strike WAV saved to: {wav_path}")
+            print(f"Playing strike {strike_count} message...")
 
+            # Do not monitor engagement during strike playback
             play_agent_wav(
-                repair_wav_path,
+                wav_path,
                 monitor_engagement=False,
-                label="engagement_repair",
+                label=f"strike_{strike_count}",
             )
 
+            # Record in dialogue history
             pipeline.state.add_turn(
                 DialogueTurn(
                     user_input=UserTurnInput(
                         user_text=(
-                            "[system_event] Engagement dropped while Aera was speaking; "
-                            "Aera made a brief interaction-repair move."
+                            f"[system_event] Engagement repair strike {strike_count}/3 triggered. "
+                            f"Reason: {repair_request.reason}. "
+                            f"Score: {repair_request.score if repair_request.score is not None else 'unknown'}."
                         )
                     ),
                     engagement=EngagementState(
                         score=repair_request.score if repair_request.score is not None else 0.5,
-                        summary="Engagement repair triggered during agent speech.",
+                        summary=f"Strike {strike_count}/3 triggered.",
                         metadata={
                             "source": "engagement_watchdog",
+                            "strike": strike_count,
                             "reason": repair_request.reason,
                             "drop": repair_request.drop,
                             "observed_for_seconds": repair_request.observed_for_seconds,
                         },
                     ),
-                    output=repair_output,
-                    raw_llm_output=repair_annotated_response,
+                    output=strike_output,
+                    raw_llm_output=strike_annotated_response,
                     metadata={
-                        "type": "engagement_repair",
+                        "type": "engagement_strike",
+                        "strike_number": strike_count,
                     },
                 )
             )
 
         except Exception as exc:
-            print("\nERROR while generating or playing engagement repair audio:")
+            print(f"\nERROR while generating or playing strike {strike_count} audio:")
             print(exc)
+
+        # After strike 3, end the session
+        if strike_count >= 3:
+            print("\n" + "=" * 60)
+            print("SESSION ENDED — 3 strikes reached.")
+            print("=" * 60)
+            session_ended = True
+
+    # =========================================================================
+    # INTERVIEW START
+    # =========================================================================
 
     print("\nVoice dialogue pipeline ready.")
     print("Aera will start the interview.")
     print("After Aera speaks, the microphone will listen automatically.")
+    print("3-strike system active: engagement drops trigger escalating repairs.")
     print("Press Ctrl+C to quit.")
     print("Speak in English after Aera's first question.\n")
 
@@ -542,8 +578,11 @@ def main() -> None:
 
     engagement_warning_printed = False
 
+    # =========================================================================
+    # MAIN CONVERSATION LOOP
+    # =========================================================================
     try:
-        while True:
+        while not session_ended:
             if not engagement.is_running() and not engagement_warning_printed:
                 print("\nWARNING: Engagement recognizer is no longer running.")
                 print("This probably happened because the OpenCV window was closed or q was pressed.")
@@ -553,11 +592,9 @@ def main() -> None:
 
             current_score = engagement.get_latest_score()
             score_text = "unknown" if current_score is None else f"{current_score:.3f}"
-            print(f"\nCurrent engagement={score_text}. Waiting for candidate speech...")
+            print(f"\nCurrent engagement={score_text} | Strikes={strike_count}/3 | Waiting for candidate speech...")
 
             if agent_speaking:
-                # In this local TTS version, play_agent_wav is blocking, so this should
-                # normally never happen. The guard is useful for future Unreal integration.
                 print("Agent is still speaking; microphone is not armed yet.")
                 continue
 
@@ -598,7 +635,45 @@ def main() -> None:
                 print("No speech detected by Whisper. Listening again.\n")
                 continue
 
+            # =================================================================
+            # CHECK: Should Aera interrupt the candidate with a strike?
+            # If engagement is critically low right now AND cooldown has passed,
+            # fire a strike instead of processing the turn normally.
+            # This makes Aera interrupt the candidate, not just herself.
+            # =================================================================
             engagement_score = engagement.get_latest_score()
+
+            if (
+                not args.disable_engagement_watchdog
+                and strike_count < 3
+                and engagement_score is not None
+                and engagement_score <= args.repair_threshold
+            ):
+                cooldown_ok = (
+                    last_strike_time is None
+                    or time.time() - last_strike_time >= args.repair_cooldown
+                )
+                if cooldown_ok:
+                    print(
+                        f"\n[engagement-check] Engagement={engagement_score:.3f} "
+                        f"(below {args.repair_threshold}) during candidate turn — "
+                        f"triggering strike!",
+                        flush=True,
+                    )
+                    interrupt_request = EngagementRepairRequest(
+                        requested=True,
+                        reason="low_during_candidate_turn",
+                        score=engagement_score,
+                        drop=None,
+                        observed_for_seconds=0.0,
+                    )
+                    last_strike_time = time.time()
+                    execute_strike(interrupt_request)
+                    if session_ended:
+                        break
+                    # After the strike, go back to listening (skip Qwen this turn)
+                    continue
+
             if engagement_score is None:
                 print("Engagement score sent to prompt: unavailable -> using neutral 0.500")
             else:
@@ -646,8 +721,8 @@ def main() -> None:
                     label="agent_turn",
                 )
 
-                if repair_request.requested:
-                    synthesize_and_play_repair(repair_request)
+                if repair_request.requested and strike_count < 3:
+                    execute_strike(repair_request)
 
             except Exception as exc:
                 agent_speaking = False
@@ -663,6 +738,12 @@ def main() -> None:
         print("\nStopping engagement recognizer...")
         engagement.stop()
         print("Stopped.")
+
+        if session_ended:
+            print("\nSession ended after 3 engagement strikes.")
+            print(f"Total dialogue turns: {pipeline.state.turn_count}")
+        
+        print("Goodbye.")
 
 
 if __name__ == "__main__":
