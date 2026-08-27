@@ -12,7 +12,11 @@ from dialogue_manager.core.pipeline import DialoguePipeline
 from dialogue_manager.engagement.realtime_subprocess import RealtimeEngagementSubprocessAnalyzer
 from dialogue_manager.engagement.types import EngagementState
 from dialogue_manager.llm.qwen_client import QwenLLMClient
-from dialogue_manager.stt.audio_io import list_input_devices, wait_for_speech_then_record_until_silence
+from dialogue_manager.stt.audio_io import (
+    RecordingResult,
+    list_input_devices,
+    wait_for_speech_then_record_until_silence,
+)
 from dialogue_manager.stt.whisper_local import WhisperLocalSTT
 from dialogue_manager.tts.formatter import build_tts_api_text
 from dialogue_manager.core.turn import DialogueTurn, UserTurnInput
@@ -598,10 +602,30 @@ def main() -> None:
                 print("Agent is still speaking; microphone is not armed yet.")
                 continue
 
+            # =================================================================
+            # CONTINUOUS WATCHDOG DURING THE CANDIDATE TURN
+            # Engagement is monitored while the microphone is armed and while
+            # the candidate is speaking. If the score falls to/below the repair
+            # threshold (default 0.20) and the cooldown has elapsed, the
+            # recording is aborted mid-turn so Aera can interrupt the candidate
+            # immediately instead of waiting for them to finish.
+            # =================================================================
+            def _should_interrupt_candidate() -> bool:
+                if args.disable_engagement_watchdog or strike_count >= 3:
+                    return False
+                score = engagement.get_latest_score()
+                if score is None or score > args.repair_threshold:
+                    return False
+                cooldown_ok = (
+                    last_strike_time is None
+                    or time.time() - last_strike_time >= args.repair_cooldown
+                )
+                return cooldown_ok
+
             with tempfile.TemporaryDirectory() as temp_dir:
                 audio_path = Path(temp_dir) / "user_turn.wav"
 
-                speech_detected = wait_for_speech_then_record_until_silence(
+                recording_result = wait_for_speech_then_record_until_silence(
                     output_path=audio_path,
                     sample_rate=args.sample_rate,
                     device_index=args.device_index,
@@ -617,9 +641,35 @@ def main() -> None:
                     max_record_seconds=args.duration,
                     max_wait_seconds=args.max_wait_seconds,
                     pre_roll_seconds=args.pre_roll_seconds,
+                    abort_check=_should_interrupt_candidate,
                 )
 
-                if not speech_detected:
+                # The watchdog interrupted the candidate mid-turn: fire a strike
+                # instead of transcribing an abandoned recording.
+                if recording_result == RecordingResult.ABORTED:
+                    interrupt_score = engagement.get_latest_score()
+                    print(
+                        f"\n[engagement-check] Engagement="
+                        f"{interrupt_score if interrupt_score is None else round(interrupt_score, 3)} "
+                        f"(at or below {args.repair_threshold}) during candidate turn — "
+                        f"interrupting the candidate and triggering strike!",
+                        flush=True,
+                    )
+                    interrupt_request = EngagementRepairRequest(
+                        requested=True,
+                        reason="low_during_candidate_turn",
+                        score=interrupt_score,
+                        drop=None,
+                        observed_for_seconds=0.0,
+                    )
+                    last_strike_time = time.time()
+                    execute_strike(interrupt_request)
+                    if session_ended:
+                        break
+                    # After the strike, go back to listening (skip Qwen this turn)
+                    continue
+
+                if recording_result != RecordingResult.RECORDED:
                     continue
 
                 print("\nTranscribing with Whisper...")
@@ -635,44 +685,7 @@ def main() -> None:
                 print("No speech detected by Whisper. Listening again.\n")
                 continue
 
-            # =================================================================
-            # CHECK: Should Aera interrupt the candidate with a strike?
-            # If engagement is critically low right now AND cooldown has passed,
-            # fire a strike instead of processing the turn normally.
-            # This makes Aera interrupt the candidate, not just herself.
-            # =================================================================
             engagement_score = engagement.get_latest_score()
-
-            if (
-                not args.disable_engagement_watchdog
-                and strike_count < 3
-                and engagement_score is not None
-                and engagement_score <= args.repair_threshold
-            ):
-                cooldown_ok = (
-                    last_strike_time is None
-                    or time.time() - last_strike_time >= args.repair_cooldown
-                )
-                if cooldown_ok:
-                    print(
-                        f"\n[engagement-check] Engagement={engagement_score:.3f} "
-                        f"(below {args.repair_threshold}) during candidate turn — "
-                        f"triggering strike!",
-                        flush=True,
-                    )
-                    interrupt_request = EngagementRepairRequest(
-                        requested=True,
-                        reason="low_during_candidate_turn",
-                        score=engagement_score,
-                        drop=None,
-                        observed_for_seconds=0.0,
-                    )
-                    last_strike_time = time.time()
-                    execute_strike(interrupt_request)
-                    if session_ended:
-                        break
-                    # After the strike, go back to listening (skip Qwen this turn)
-                    continue
 
             if engagement_score is None:
                 print("Engagement score sent to prompt: unavailable -> using neutral 0.500")
