@@ -1,11 +1,21 @@
 from __future__ import annotations
 
 from collections import deque
+from enum import Enum
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
+
+
+class RecordingResult(Enum):
+    """Outcome of an armed microphone recording attempt."""
+
+    RECORDED = "recorded"        # Speech was captured and written to file.
+    NO_SPEECH = "no_speech"      # max_wait_seconds elapsed with no speech onset.
+    ABORTED = "aborted"          # abort_check requested an early stop mid-turn.
 
 
 def list_input_devices() -> None:
@@ -170,15 +180,27 @@ def wait_for_speech_then_record_until_silence(
     max_wait_seconds: float | None = None,
     pre_roll_seconds: float = 0.3,
     block_seconds: float = 0.1,
-) -> bool:
+    abort_check: Callable[[], bool] | None = None,
+) -> RecordingResult:
     """
     Wait until speech is detected, then record until continuous silence.
 
     This is intended for turn-taking dialogue:
     - while the agent is speaking, do not call this function;
     - once the agent has finished, call it to arm the microphone;
-    - it ignores initial silence and starts saving audio only after speech begins;
-    - it returns True if speech was recorded, False if max_wait_seconds elapsed.
+    - it ignores initial silence and starts saving audio only after speech begins.
+
+    Continuous monitoring:
+    - ``abort_check`` is an optional callback evaluated once per audio block
+      (approximately every ``block_seconds``), both while waiting for speech and
+      while recording. If it returns True, the recording stops immediately and
+      the function returns ``RecordingResult.ABORTED``. This lets an external
+      watchdog (e.g. an engagement monitor) interrupt the user mid-turn.
+
+    Returns a ``RecordingResult``:
+    - ``RECORDED``  if speech was captured and written to ``output_path``;
+    - ``NO_SPEECH`` if ``max_wait_seconds`` elapsed before any speech onset;
+    - ``ABORTED``   if ``abort_check`` requested an early stop.
 
     The thresholds are simple RMS thresholds, not a semantic VAD. Whisper still
     receives the final audio and applies its own VAD during transcription.
@@ -217,6 +239,15 @@ def wait_for_speech_then_record_until_silence(
         blocksize=block_samples,
     ) as stream:
         while True:
+            # Continuous watchdog: allow an external monitor to abort at any
+            # point, whether we are still waiting for speech or already recording.
+            if abort_check is not None and abort_check():
+                print(
+                    "Recording aborted by watchdog (engagement dropped).",
+                    flush=True,
+                )
+                return RecordingResult.ABORTED
+
             if (
                 not recording_started
                 and max_wait_seconds is not None
@@ -226,7 +257,7 @@ def wait_for_speech_then_record_until_silence(
                     f"No speech detected after {max_wait_seconds:.1f}s. Skipping turn.",
                     flush=True,
                 )
-                return False
+                return RecordingResult.NO_SPEECH
 
             block, overflowed = stream.read(block_samples)
 
@@ -279,7 +310,7 @@ def wait_for_speech_then_record_until_silence(
                 break
 
     if not recorded_blocks:
-        return False
+        return RecordingResult.NO_SPEECH
 
     audio = np.concatenate(recorded_blocks, axis=0)
 
@@ -297,4 +328,4 @@ def wait_for_speech_then_record_until_silence(
     sf.write(output_path, audio, sample_rate)
 
     print(f"Audio saved to: {output_path}")
-    return True
+    return RecordingResult.RECORDED

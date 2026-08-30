@@ -162,11 +162,34 @@ PROSODY_CONFIG = {
     # Prosody sub-weights (how much each audio feature matters)
     # These multiply the deviation from calibration baseline:
     "w_intensity": 0.8,            # Louder than baseline = more engaged
-    "w_rhythm": 0.6,               # More variation in intensity = more animated
+    "w_rhythm": 0.6,               # Faster speech than baseline = more engaged
     "w_f0": 0.5,                   # Pitch variation = more expressive
 
     # Silence detection threshold (RMS below this = "not speaking")
     "silence_rms_thresh": 0.01,
+}
+
+# -----------------------------------------------------------------------------
+# SPEECH-RATE (RHYTHM) CONFIGURATION
+# -----------------------------------------------------------------------------
+# "Rhythm" is estimated as the user's speaking rate in syllables per second,
+# approximated directly from the acoustic signal (no ASR transcription needed)
+# by intensity-peak counting -- the principle behind Praat's automatic
+# syllable-nuclei detection (De Jong & Wempe, 2009).
+#
+# A candidate syllable nucleus is a local maximum of the intensity contour that
+# (a) rises at least PEAK_PROMINENCE_DB above the surrounding intensity dips,
+# and (b) coincides with voiced material. The count of accepted peaks divided by
+# the voiced duration of the window gives an estimate of the syllable rate.
+
+SYLLABLE_RATE_CONFIG = {
+    # Minimum prominence (in dB) a local intensity peak must have above its
+    # neighbouring dips to count as a syllable nucleus. 2 dB is the standard
+    # De Jong & Wempe default; raise it (e.g. 3-4 dB) for noisier recordings.
+    "peak_prominence_db": 2.0,
+    # A peak must sit on voiced material: the fraction of voiced pitch frames
+    # near the peak must be at least this value.
+    "voiced_fraction_at_peak": 0.30,
 }
 
 # -----------------------------------------------------------------------------
@@ -837,6 +860,91 @@ def audio_level(y: Optional[np.ndarray]) -> Tuple[float, float]:
     return float(np.sqrt(np.mean(np.square(y)))), float(np.max(np.abs(y)))
 
 
+def estimate_syllable_rate(
+    intensity_values: np.ndarray,
+    voiced_mask: np.ndarray,
+    time_step: float,
+    peak_prominence_db: float,
+    voiced_fraction_at_peak: float,
+) -> float:
+    """
+    Estimate speaking rate in syllables per second by intensity-peak counting.
+
+    This follows the principle of Praat's automatic syllable-nuclei detection
+    (De Jong & Wempe, 2009): a syllable nucleus is a local maximum of the
+    intensity contour that (a) rises at least ``peak_prominence_db`` above the
+    surrounding intensity dips, and (b) sits on voiced material. The number of
+    accepted peaks divided by the voiced duration of the window gives the rate.
+
+    Args:
+        intensity_values: intensity contour (dB), one value per analysis frame.
+        voiced_mask: boolean array (same frame grid as pitch) marking voiced frames.
+        time_step: seconds between consecutive intensity frames.
+        peak_prominence_db: minimum dip-to-peak rise for a valid nucleus.
+        voiced_fraction_at_peak: minimum voiced fraction in a small window
+            around the peak for it to count.
+
+    Returns:
+        Estimated syllable rate in syllables per second (>= 0.0).
+    """
+    n = intensity_values.size
+    if n < 3 or time_step <= 0.0:
+        return 0.0
+
+    # Voiced duration of this window, used as the denominator. Pitch and
+    # intensity are sampled on the same 10 ms grid, so we can reuse voiced_mask.
+    voiced_frames = int(np.count_nonzero(voiced_mask)) if voiced_mask.size else 0
+    voiced_duration = voiced_frames * time_step
+    if voiced_duration <= 0.0:
+        return 0.0
+
+    # Map an intensity-frame index onto the voiced mask (guard length mismatch).
+    def is_peak_voiced(idx: int) -> bool:
+        if voiced_mask.size == 0:
+            return True
+        # small +/- 2 frame window around the peak
+        lo = max(0, idx - 2)
+        hi = min(voiced_mask.size, idx + 3)
+        window = voiced_mask[lo:hi]
+        if window.size == 0:
+            return False
+        return float(np.mean(window)) >= voiced_fraction_at_peak
+
+    peaks = 0
+    # A local maximum: strictly greater than immediate neighbours.
+    for i in range(1, n - 1):
+        if not (intensity_values[i] > intensity_values[i - 1]
+                and intensity_values[i] >= intensity_values[i + 1]):
+            continue
+
+        # Nearest dip to the left: scan back until intensity rises again.
+        left_min = intensity_values[i]
+        j = i - 1
+        while j >= 0 and intensity_values[j] <= left_min:
+            left_min = intensity_values[j]
+            j -= 1
+
+        # Nearest dip to the right.
+        right_min = intensity_values[i]
+        k = i + 1
+        while k < n and intensity_values[k] <= right_min:
+            right_min = intensity_values[k]
+            k += 1
+
+        # Prominence = rise above the higher of the two neighbouring dips.
+        dip = max(left_min, right_min)
+        prominence = intensity_values[i] - dip
+        if prominence < peak_prominence_db:
+            continue
+
+        if not is_peak_voiced(i):
+            continue
+
+        peaks += 1
+
+    return float(peaks) / float(voiced_duration)
+
+
 def analyze_prosody_parselmouth(
     y: Optional[np.ndarray],
     sr: int,
@@ -872,13 +980,29 @@ def analyze_prosody_parselmouth(
             minimum_pitch=float(pitch_floor),
         )
         intensity_values = np.asarray(intensity_obj.values, dtype=np.float64).reshape(-1)
-        intensity_values = intensity_values[np.isfinite(intensity_values)]
-        if intensity_values.size:
-            intensity_mean = float(np.mean(intensity_values))
-            rhythm = float(np.std(intensity_values))
-        else:
-            intensity_mean = 0.0
-            rhythm = 0.0
+        intensity_finite = intensity_values[np.isfinite(intensity_values)]
+        intensity_mean = float(np.mean(intensity_finite)) if intensity_finite.size else 0.0
+
+        # For peak counting, replace non-finite frames (edge padding) with a low
+        # sentinel so they act as dips and never register as syllable nuclei.
+        intensity_clean = np.where(
+            np.isfinite(intensity_values),
+            intensity_values,
+            (float(np.min(intensity_finite)) - 1.0) if intensity_finite.size else 0.0,
+        )
+
+        # "Rhythm" is the speaking rate in syllables per second, approximated by
+        # intensity-peak counting on the same 10 ms frame grid used for pitch.
+        # Align the voiced mask to the intensity contour (both ~10 ms frames);
+        # lengths can differ by a frame or two, so trim to the common length.
+        common = min(intensity_clean.size, voiced.size)
+        rhythm = estimate_syllable_rate(
+            intensity_values=intensity_clean[:common],
+            voiced_mask=voiced[:common],
+            time_step=0.01,
+            peak_prominence_db=SYLLABLE_RATE_CONFIG["peak_prominence_db"],
+            voiced_fraction_at_peak=SYLLABLE_RATE_CONFIG["voiced_fraction_at_peak"],
+        )
 
         return ProsodyFeatures(
             f0=f0_mean,
@@ -916,7 +1040,10 @@ def calibrate_baseline_from_audio(
                 f0_vals.append(pros.f0)
             if np.isfinite(pros.intensity) and pros.intensity > 0.0:
                 int_vals.append(pros.intensity)
-            if np.isfinite(pros.rhythm):
+            # rhythm is now syllables/second; only count windows where a
+            # non-zero rate was actually detected, so a few flat windows do
+            # not pull the baseline rate down toward zero.
+            if np.isfinite(pros.rhythm) and pros.rhythm > 0.0:
                 rhy_vals.append(pros.rhythm)
 
     if not f0_vals:
@@ -924,7 +1051,10 @@ def calibrate_baseline_from_audio(
     if not int_vals:
         int_vals = [55.0]
     if not rhy_vals:
-        rhy_vals = [2.0]
+        # Fallback baseline speaking rate in syllables/second, roughly the
+        # typical conversational rate, used only if calibration found no voiced
+        # speech. The rhythm field now stores syllable rate, not intensity std.
+        rhy_vals = [4.0]
 
     return Baseline(
         f0=float(np.mean(f0_vals)),
@@ -949,10 +1079,24 @@ def baseline_drift_update(
     return Baseline(f0=float(f0_new), intensity=float(i_new), rhythm=float(r_new))
 
 
+def safe_relative_delta(x: float, base: float) -> float:
+    """Relative deviation (x - base) / base, robust to invalid inputs.
+
+    Used for the syllable-rate (rhythm) feature, which is a positive rate in
+    syllables/second rather than a dB-scale quantity. A value above zero means
+    the user is speaking faster than their calibrated baseline.
+    """
+    if not np.isfinite(x) or not np.isfinite(base) or base <= EPS:
+        return 0.0
+    return float((x - base) / base)
+
+
 def prosody_deltas(pros: ProsodyFeatures, baseline: Baseline) -> Tuple[float, float, float]:
     dF0 = safe_log_ratio(pros.f0, baseline.f0)
     dI = safe_db_delta(pros.intensity, baseline.intensity, scale_db=10.0)
-    dR = safe_db_delta(pros.rhythm, baseline.rhythm, scale_db=10.0)
+    # Rhythm is now a syllable rate, so its deviation is measured relative to
+    # the speaker's baseline rate rather than on a dB scale.
+    dR = safe_relative_delta(pros.rhythm, baseline.rhythm)
     return dF0, dI, dR
 
 
@@ -1191,7 +1335,7 @@ def open_csv_writer(path: Optional[str]):
     f = open(out_path, "w", newline="", encoding="utf-8")
     fieldnames = [
         "wall_time", "frame_id",
-        "f0", "intensity_db", "rhythm_db_std", "rms", "voiced_ratio",
+        "f0", "intensity_db", "syllable_rate", "rms", "voiced_ratio",
         "dF0", "dI", "dR",
         "role", "raw_role",
         "gaze", "gaze_ratio_role_window", "gaze_threshold",
@@ -1380,7 +1524,7 @@ def main() -> int:
                         )
                         print(
                             f"Baseline calibrated: f0={baseline.f0:.1f}Hz "
-                            f"intensity={baseline.intensity:.1f}dB rhythm={baseline.rhythm:.2f}",
+                            f"intensity={baseline.intensity:.1f}dB rate={baseline.rhythm:.2f}syll/s",
                             flush=True,
                         )
                         calibrating = False
@@ -1495,7 +1639,7 @@ def main() -> int:
                         "frame_id": frame_id,
                         "f0": latest_pros.f0,
                         "intensity_db": latest_pros.intensity,
-                        "rhythm_db_std": latest_pros.rhythm,
+                        "syllable_rate": latest_pros.rhythm,
                         "rms": latest_pros.rms,
                         "voiced_ratio": latest_pros.voiced_ratio,
                         "dF0": dF0,
