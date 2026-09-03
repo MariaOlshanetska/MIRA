@@ -149,9 +149,3 @@ The prompt files (agent scenario and behaviour) are kept separate from the code,
 | Embodiment | MetaHuman in Unreal Engine (work in progress) |
 
 Development was carried out with the assistance of [Kiro](https://kiro.dev), from precise instructions defining the intended behaviour of each component. All generated code was reviewed, tested, and adapted to the intended design.
-
----
-
-## Author
-
-Maria Olshanetska — Master's Thesis in Cognitive Science.
