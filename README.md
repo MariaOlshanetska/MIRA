@@ -2,8 +2,6 @@
 
 **M**ultimodal **I**nteractive **R**esponsive **A**gent — an LLM-based embodied conversational agent that perceives the user through voice and camera, estimates their interaction state (*engagement*), and responds with expressive speech and (work in progress) gestures on a MetaHuman in Unreal Engine.
 
-This repository contains the code for Maria Olshanetska's Master's Thesis (TFM) in Cognitive Science.
-
 > **Project status.** The full speech pathway (listen → transcribe → estimate engagement → generate response → speak with expressive voice) works end to end. Real-time rendering of gestures and facial expressions on the MetaHuman is ongoing work: the annotations are generated, parsed, and logged, but not yet rendered in real time.
 
 ---
