@@ -154,16 +154,6 @@ Development was carried out with the assistance of [Kiro](https://kiro.dev), fro
 
 ---
 
-## Development
-
-```bash
-pytest        # run the tests
-ruff check .  # linter
-mypy src      # type-checking
-```
-
----
-
 ## Author
 
 Maria Olshanetska — Master's Thesis in Cognitive Science.
